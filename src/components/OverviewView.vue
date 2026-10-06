@@ -93,11 +93,11 @@ const incidentList = computed(() => store.incidents.filter(i => i.status !== 'cl
           <div class="mrow">
             <span class="t ph" style="font-size:11.5px">
               <span v-if="i.venue">📍 {{ i.venue.name }}</span>
-              <span v-if="i.match" style="margin-left:8px">🏟️ {{ i.match.teamA?.name }} VS {{ i.match.teamB?.name }}</span>
+              <span v-if="(i.match_links || []).length" style="margin-left:8px">🏟️ 关联 {{ i.match_links.length }} 场{{ i.match_links.length > 1 ? '：' + i.match_links.slice(0, 2).map(m => (m.teamA?.name || '待定') + 'VS' + (m.teamB?.name || '待定')).join('、') + (i.match_links.length > 2 ? ' 等' : '') : ' ' + (i.match?.teamA?.name || '') + 'VS' + (i.match?.teamB?.name || '') }}</span>
             </span>
             <span class="row" style="gap:4px">
               <span v-if="i.impact?.badges_blocked" class="tag r">🪪 暂扣 {{ i.impact.badges_blocked }}</span>
-              <span v-if="store.matches.some(m => m.pause_incident_id === i.id && m.is_paused)" class="tag r">⏸️ 场次暂停中</span>
+              <span v-if="store.matches.filter(m => m.pause_incident_id === i.id && m.is_paused).length" class="tag r">⏸️ 暂停 {{ store.matches.filter(m => m.pause_incident_id === i.id && m.is_paused).length }} 场</span>
               <span v-else-if="i.impact?.matches_rescheduled" class="tag y">📅 改期 {{ i.impact.matches_rescheduled }} 场</span>
             </span>
           </div>

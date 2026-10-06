@@ -290,6 +290,17 @@ CREATE TABLE IF NOT EXISTS incident_badges (
   released_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_incident_badges ON incident_badges(incident_id, badge_id);
+-- 事件与场次的关联（一次事件可关联多场比赛；is_primary=1 对应 incidents.match_id 主关联场次）
+-- 暂停/恢复/改期均以本关联为批量作用域，联动结果逐场回写 matches 并写入三套审计
+CREATE TABLE IF NOT EXISTS incident_matches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  match_id INTEGER NOT NULL,
+  is_primary INTEGER NOT NULL DEFAULT 0,   -- 1=上报时主关联场次（同步 incidents.match_id）
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_matches_pair ON incident_matches(incident_id, match_id);
+CREATE INDEX IF NOT EXISTS idx_incident_matches_match ON incident_matches(match_id);
 `)
 
 // —— 旧库迁移：补充字段（列已存在则忽略） ——
