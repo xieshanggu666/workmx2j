@@ -290,6 +290,14 @@ CREATE TABLE IF NOT EXISTS incident_badges (
   released_at TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_incident_badges ON incident_badges(incident_id, badge_id);
+-- 事件与场次的关联（一起安全事件可关联多场比赛；暂停/恢复/改期按关联集合批量联动）
+CREATE TABLE IF NOT EXISTS incident_matches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  incident_id INTEGER NOT NULL,
+  match_id INTEGER NOT NULL,
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_incident_matches ON incident_matches(incident_id, match_id);
 `)
 
 // —— 旧库迁移：补充字段（列已存在则忽略） ——
@@ -336,6 +344,9 @@ db.prepare(`UPDATE matches SET winner = CASE WHEN score_a > score_b THEN team_a 
 ].forEach(([col, def]) => {
   try { db.prepare(`ALTER TABLE matches ADD COLUMN ${col} ${def}`).run() } catch (e) { /* 列已存在 */ }
 })
+// 旧库迁移：把 incidents.match_id 单场次关联回填到多场次关联表（幂等）
+db.prepare(`INSERT OR IGNORE INTO incident_matches (incident_id,match_id)
+            SELECT id, match_id FROM incidents WHERE match_id IS NOT NULL`).run()
 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }

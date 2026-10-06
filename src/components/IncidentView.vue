@@ -45,12 +45,17 @@ const counts = computed(() => {
 })
 
 /* ---------- 协同上报 ---------- */
-const form = reactive({ category: 'injury', reporter_role: 'medical', reporter_name: '', venue_id: '', match_id: '', description: '' })
-function resetForm() { form.reporter_name = ''; form.venue_id = ''; form.match_id = ''; form.description = '' }
-// 选择场次时自动带出比赛场地
-function pickVenueByMatch() {
-  const m = store.matches.find(x => x.id === Number(form.match_id))
-  if (m?.venue_id) form.venue_id = String(m.venue_id)
+const form = reactive({ category: 'injury', reporter_role: 'medical', reporter_name: '', venue_id: '', match_ids: [], description: '' })
+function resetForm() { form.reporter_name = ''; form.venue_id = ''; form.match_ids = []; form.description = '' }
+// 勾选关联场次（可多场）：首个选中场次自动带出比赛场地
+function toggleReportMatch(mid) {
+  const i = form.match_ids.indexOf(mid)
+  if (i >= 0) form.match_ids.splice(i, 1)
+  else form.match_ids.push(mid)
+  if (form.match_ids.length) {
+    const m = store.matches.find(x => x.id === form.match_ids[0])
+    if (m?.venue_id) form.venue_id = String(m.venue_id)
+  }
 }
 async function submit() {
   if (!form.description.trim()) return flash('请描述事件经过', false)
@@ -59,10 +64,10 @@ async function submit() {
       category: form.category, reporter_role: form.reporter_role,
       reporter_name: form.reporter_name.trim(),
       venue_id: form.venue_id ? Number(form.venue_id) : null,
-      match_id: form.match_id ? Number(form.match_id) : null,
+      match_ids: [...form.match_ids],
       description: form.description.trim()
     })
-    flash(`✅ 事件已上报（编号 ${r.code}），等待组委会分级派单`)
+    flash(`✅ 事件已上报（编号 ${r.code}）${form.match_ids.length > 1 ? `，已关联 ${form.match_ids.length} 场比赛` : ''}，等待组委会分级派单`)
     resetForm()
     statusFilter.value = 'all'
   } catch (e) { flash(e.message, false) }
@@ -113,14 +118,30 @@ async function releaseLink(i, link) {
   catch (e) { flash(e.message, false) }
 }
 
-// 暂停场次
-const pauseF = reactive({ match_id: '', reason: '' })
-function openPause(i) { openPanel(i.id, 'pause'); pauseF.match_id = i.match_id || ''; pauseF.reason = '' }
+// 暂停场次（可一次勾选多场批量暂停）
+const pauseF = reactive({ match_ids: [], reason: '' })
+function openPause(i) {
+  openPanel(i.id, 'pause')
+  // 默认勾选事件已关联且尚未暂停的待赛场次
+  pauseF.match_ids = (i.match_ids || []).filter(mid => {
+    const m = store.matches.find(x => x.id === mid)
+    return m && m.status === 'scheduled' && !m.is_paused
+  })
+  pauseF.reason = ''
+}
+function togglePauseMatch(mid) {
+  const i = pauseF.match_ids.indexOf(mid)
+  if (i >= 0) pauseF.match_ids.splice(i, 1)
+  else pauseF.match_ids.push(mid)
+}
 async function submitPause(i) {
-  if (!pauseF.match_id) return flash('请选择要暂停的场次', false)
+  if (!pauseF.match_ids.length) return flash('请选择要暂停的场次', false)
   if (!pauseF.reason.trim()) return flash('暂停原因必填', false)
-  try { await store.incidentPause(i.id, { match_id: Number(pauseF.match_id), reason: pauseF.reason.trim() }); flash('⏸️ 场次已暂停：入场核验与比分录入已锁定'); closePanel() }
-  catch (e) { flash(e.message, false) }
+  try {
+    const r = await store.incidentPause(i.id, { match_ids: [...pauseF.match_ids], reason: pauseF.reason.trim() })
+    flash(r.paused > 1 ? `⏸️ 已批量暂停 ${r.paused} 场比赛：入场核验与比分录入同步锁定` : '⏸️ 场次已暂停：入场核验与比分录入已锁定')
+    closePanel()
+  } catch (e) { flash(e.message, false) }
 }
 // 恢复场次
 async function resumeMatch(i, matchId) {
@@ -128,25 +149,36 @@ async function resumeMatch(i, matchId) {
   try { await store.incidentResume(i.id, { match_id: matchId, note: '现场处置完毕，恢复比赛' }); flash('▶️ 场次已恢复') }
   catch (e) { flash(e.message, false) }
 }
-// 改期
+// 一键恢复本事件全部暂停场次
+async function resumeAll(i) {
+  const n = pausedMatchesOf(i).length
+  if (!confirm(`确认一键恢复本事件暂停的 ${n} 场比赛？恢复后入场核验放行、可正常录入比分。`)) return
+  try {
+    const r = await store.incidentResume(i.id, { all: true, note: '现场处置完毕，批量恢复比赛' })
+    flash(`▶️ 已批量恢复 ${r.resumed} 场比赛，入场核验与成绩录入同步恢复`)
+  } catch (e) { flash(e.message, false) }
+}
+// 改期（单场或批量：items 逐场携带新时间/场地，整单原子成功或回滚）
 const TIME_PRESETS = ['09:00', '09:20', '09:30', '09:40', '10:00', '10:20', '10:40', '11:00', '11:20', '12:30', '13:00', '14:00', '14:30', '15:30', '16:00', '16:30', '17:00']
-const resched = reactive({ show: false, match_id: null, time_label: '', venue_id: '', reason: '', error: '', force: false })
+const resched = reactive({ items: [], reason: '', error: '', force: false })
 function openReschedule(i, m) {
-  const mm = m || store.matches.find(x => x.id === i.match_id)
+  // 指定单场则从暂停横幅改期；未指定则批量带入本事件全部暂停场次
+  const list = m ? [m] : pausedMatchesOf(i)
   openPanel(i.id, 'reschedule')
-  resched.match_id = mm?.id || null; resched.time_label = mm?.time_label || ''; resched.venue_id = mm?.venue_id || ''
+  resched.items = list.map(x => ({ match_id: x.id, title: matchLabel(x), time_label: x.time_label || '', venue_id: x.venue_id || '' }))
   resched.reason = ''; resched.error = ''; resched.force = false
 }
 async function submitReschedule(i) {
-  if (!resched.time_label.trim()) return flash('请填写改期时间', false)
+  if (!resched.items.length) return flash('没有需要改期的场次', false)
+  if (resched.items.some(x => !String(x.time_label).trim())) return flash('请填写每场的新时间', false)
   if (!resched.reason.trim()) return flash('改期原因必填并留痕', false)
   try {
-    await store.incidentReschedule(i.id, {
-      match_id: resched.match_id, time_label: resched.time_label.trim(),
-      venue_id: resched.venue_id ? Number(resched.venue_id) : null,
+    const r = await store.incidentReschedule(i.id, {
+      items: resched.items.map(x => ({ match_id: x.match_id, time_label: String(x.time_label).trim(), venue_id: x.venue_id ? Number(x.venue_id) : null })),
       reason: resched.reason.trim(), force: resched.force
     })
-    flash('📅 场次已改期，暂停同步解除，执法名单已自动重排/补齐'); closePanel()
+    flash(r.count > 1 ? `📅 已批量改期 ${r.count} 场比赛，暂停同步解除，执法名单已自动重排/补齐` : '📅 场次已改期，暂停同步解除，执法名单已自动重排/补齐')
+    closePanel()
   } catch (e) { resched.error = e.message; flash(e.message, false) }
 }
 
@@ -234,12 +266,14 @@ const badgeBrief = b => `${b.code} · ${b.name}（${SUBJECT_TEXT[b.subject_type]
               <option v-for="v in store.venues" :key="v.id" :value="v.id">{{ v.name }}</option>
             </select>
           </div>
-          <div class="form-row">
-            <label>关联场次</label>
-            <select v-model="form.match_id" @change="pickVenueByMatch" style="flex:1">
-              <option value="">与场次无关 / 稍后关联</option>
-              <option v-for="m in scheduledMatches" :key="m.id" :value="m.id">{{ matchLabel(m) }}</option>
-            </select>
+          <div class="form-row" style="align-items:flex-start">
+            <label style="margin-top:7px">关联场次</label>
+            <div style="flex:1">
+              <div class="filters match-pick">
+                <button v-for="m in scheduledMatches" :key="m.id" class="chip sm-chip" :class="{ on: form.match_ids.includes(m.id) }" @click="toggleReportMatch(m.id)">{{ matchLabel(m) }}</button>
+              </div>
+              <div class="hint" style="margin-top:4px">可一次关联多场比赛（暂停/恢复/改期将同步联动），不选则稍后关联</div>
+            </div>
           </div>
           <div class="form-row" style="align-items:flex-start">
             <label style="margin-top:7px">事件经过</label>
@@ -259,8 +293,8 @@ const badgeBrief = b => `${b.code} · ${b.name}（${SUBJECT_TEXT[b.subject_type]
           <p><span class="tag o">待分级</span> 任意岗位上报后，由组委会评估等级并派单：<span class="tag r">重大</span><span class="tag y">较大</span><span class="tag b">一般</span>，指定医疗/安保/裁判/组委会牵头。</p>
           <p>· <b>🩺 医疗</b>：伤病急救、转运与伤情反馈；<b>🚨 安保</b>：秩序控制、人员隔离与证件暂扣；<b>🧑‍⚖️ 裁判</b>：暂停/恢复比赛、裁判组调度；<b>🎛️ 组委会</b>：分级派单、改期决策与结案。</p>
           <p>· <b>🪪 证件暂扣</b>：联动证件体系人工暂扣，入场核验一律 <b>BADGE_BLOCKED</b> 拦截并计入异常审计；可在处置中解除，结案默认统一解除（可选择继续暂扣留痕）。</p>
-          <p>· <b>⏸️ 场次暂停</b>：关联待赛场次立即锁定——入场核验拒绝（<span class="mono">MATCH_PAUSED</span>）、成绩录入锁定、普通改期入口锁定。</p>
-          <p>· <b>📅 暂停改期</b>：复用赛程变更引擎（场地/裁判冲突检测、自动重排、无法解决整单回滚），成功后自动解除暂停并记录原档期。</p>
+          <p>· <b>⏸️ 场次暂停</b>：一起事件可关联多场比赛并一键批量暂停——入场核验拒绝（<span class="mono">MATCH_PAUSED</span>）、成绩录入锁定、普通改期入口锁定，逐场写入事件/入场/排班三类审计。</p>
+          <p>· <b>▶️ 恢复 / 📅 改期</b>：暂停场次可逐场或一键全部恢复；批量改期复用赛程变更引擎（场地/裁判冲突检测、自动重排、无法解决整单原子回滚），成功后自动解除暂停并记录原档期。</p>
           <p>· <b>处置完成 → 待结案 → 组委会结案</b>：暂停场次未恢复/改期不得完成处置；仍有暂停场次不得结案；每一步均在 <b>BEGIN IMMEDIATE 单事务</b> 内完成、幂等可重放，全量写入安全事件审计。</p>
         </div>
       </div>
@@ -290,7 +324,7 @@ const badgeBrief = b => `${b.code} · ${b.name}（${SUBJECT_TEXT[b.subject_type]
           <div class="imeta">
             <span><span class="tag" :class="ROLE_META[i.reporter_role].tag">{{ ROLE_META[i.reporter_role].icon }} {{ ROLE_META[i.reporter_role].text }}上报</span> {{ i.reporter_name }}</span>
             <span v-if="i.venue">📍 {{ i.venue.name }}</span>
-            <span v-if="i.match">🏟️ {{ matchLabel(i.match) }}</span>
+            <span v-if="i.matches?.length">🏟️ <template v-if="i.matches.length > 1">关联 {{ i.matches.length }} 场：</template>{{ i.matches.map(m => matchLabel(m)).join('；') }}</span>
             <span>🕐 {{ i.reported_at }}</span>
           </div>
 
@@ -301,6 +335,11 @@ const badgeBrief = b => `${b.code} · ${b.name}（${SUBJECT_TEXT[b.subject_type]
               <button class="btn green sm" @click="resumeMatch(i, m.id)">▶️ 恢复</button>
               <button class="btn sm" style="background:#fff6dd;color:#c98a00" @click="openReschedule(i, m)">📅 改期</button>
             </span>
+          </div>
+          <!-- 多场批量联动：一键全部恢复 / 批量改期 -->
+          <div v-if="pausedMatchesOf(i).length > 1 && i.status !== 'closed'" class="row mt8" style="gap:6px">
+            <button class="btn green sm" @click="resumeAll(i)">▶️ 全部恢复（{{ pausedMatchesOf(i).length }} 场）</button>
+            <button class="btn sm" style="background:#fff6dd;color:#c98a00" @click="openReschedule(i, null)">📅 批量改期（{{ pausedMatchesOf(i).length }} 场）</button>
           </div>
 
           <!-- 联动状态 -->
@@ -329,7 +368,7 @@ const badgeBrief = b => `${b.code} · ${b.name}（${SUBJECT_TEXT[b.subject_type]
             <template v-else>
               <button class="btn sm" style="background:#e8f2ff;color:var(--accent3)" @click="openProgress(i)">📝 协同进展</button>
               <button class="btn sm" style="background:#ffecec;color:#e5484d" @click="openBlock(i)">🪪 暂扣证件</button>
-              <button v-if="!pausedMatchesOf(i).length" class="btn sm" style="background:#fff1e6;color:var(--accent)" @click="openPause(i)">⏸️ 暂停场次</button>
+              <button class="btn sm" style="background:#fff1e6;color:var(--accent)" @click="openPause(i)">⏸️ 暂停场次</button>
               <template v-if="i.status === 'handling'">
                 <button class="btn green sm" @click="openResolve(i)">✅ 处置完成</button>
               </template>
@@ -397,36 +436,42 @@ const badgeBrief = b => `${b.code} · ${b.name}（${SUBJECT_TEXT[b.subject_type]
             <!-- 暂停场次 -->
             <template v-else-if="panel === 'pause'">
               <div class="corr-box">
-                <div class="corr-title">⏸️ 暂停场次（入场核验与比分录入立即锁定）</div>
-                <select v-model="pauseF.match_id">
-                  <option value="" disabled>选择场次</option>
-                  <option v-for="m in scheduledMatches" :key="m.id" :value="m.id">{{ matchLabel(m) }}</option>
-                </select>
-                <input v-model="pauseF.reason" placeholder="暂停原因（必填）">
+                <div class="corr-title">⏸️ 暂停场次（可一次勾选多场，入场核验与比分录入同步锁定）</div>
+                <div class="pick-list">
+                  <label v-for="m in scheduledMatches" :key="m.id" class="pick-row" :class="{ disabled: m.is_paused }">
+                    <input type="checkbox" :checked="pauseF.match_ids.includes(m.id)" :disabled="m.is_paused" @change="togglePauseMatch(m.id)">
+                    <span>{{ matchLabel(m) }}</span>
+                    <span v-if="m.is_paused" class="tag r">{{ m.pause_incident_id === i.id ? '已暂停' : '他事件暂停' }}</span>
+                  </label>
+                </div>
+                <input v-model="pauseF.reason" placeholder="暂停原因（必填，逐场写入事件/入场/排班三类审计）">
               </div>
               <div class="row" style="justify-content:flex-end;gap:6px">
                 <button class="btn ghost sm" @click="closePanel">取消</button>
-                <button class="btn sm" style="background:#ffecec;color:#e5484d" @click="submitPause(i)">确认暂停</button>
+                <button class="btn sm" style="background:#ffecec;color:#e5484d" @click="submitPause(i)">确认暂停{{ pauseF.match_ids.length > 1 ? `（${pauseF.match_ids.length} 场）` : '' }}</button>
               </div>
             </template>
 
             <!-- 改期 -->
             <template v-else-if="panel === 'reschedule'">
               <div class="corr-box">
-                <div class="corr-title">📅 场次暂停改期（冲突自动重排，无法解决整单回滚）</div>
-                <div class="row wrap" style="gap:10px">
-                  <label>新时间
-                    <input v-model="resched.time_label" list="inc-time-presets" placeholder="如 16:30" style="width:120px;margin-left:6px">
-                    <datalist id="inc-time-presets"><option v-for="t in TIME_PRESETS" :key="t" :value="t" /></datalist>
-                  </label>
-                  <label>新场地
-                    <select v-model="resched.venue_id" style="width:160px;margin-left:6px">
-                      <option value="">未指定</option>
-                      <option v-for="v in store.venues" :key="v.id" :value="v.id">{{ v.name }}</option>
-                    </select>
-                  </label>
+                <div class="corr-title">📅 场次暂停改期（{{ resched.items.length > 1 ? `批量 ${resched.items.length} 场，` : '' }}冲突自动重排，无法解决整单回滚）</div>
+                <div v-for="it in resched.items" :key="it.match_id" class="rs-item">
+                  <div class="rs-title">{{ it.title }}</div>
+                  <div class="row wrap" style="gap:10px">
+                    <label>新时间
+                      <input v-model="it.time_label" list="inc-time-presets" placeholder="如 16:30" style="width:110px;margin-left:6px">
+                    </label>
+                    <label>新场地
+                      <select v-model="it.venue_id" style="width:150px;margin-left:6px">
+                        <option value="">未指定</option>
+                        <option v-for="v in store.venues" :key="v.id" :value="v.id">{{ v.name }}</option>
+                      </select>
+                    </label>
+                  </div>
                 </div>
-                <input v-model="resched.reason" placeholder="改期原因（必填）">
+                <datalist id="inc-time-presets"><option v-for="t in TIME_PRESETS" :key="t" :value="t" /></datalist>
+                <input v-model="resched.reason" placeholder="改期原因（必填，逐场写入事件/入场/排班三类审计）">
                 <label class="row"><input type="checkbox" v-model="resched.force" /> 存在无法自动解决的冲突时强制保留并留痕（谨慎）</label>
                 <div v-if="resched.error" class="conf-box">{{ resched.error }}</div>
               </div>
@@ -507,6 +552,12 @@ const badgeBrief = b => `${b.code} · ${b.name}（${SUBJECT_TEXT[b.subject_type]
 .corr-box { background: #fff; border: 1px dashed var(--accent3); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; gap: 9px; }
 .corr-title { font-weight: 800; font-size: 13px; }
 .conf-box { background: #fff5f5; border: 1px solid #f0a1a1; border-radius: 8px; padding: 8px 10px; font-size: 12px; }
+.match-pick { max-height: 108px; overflow: auto; }
+.pick-list { display: flex; flex-direction: column; gap: 4px; max-height: 180px; overflow: auto; }
+.pick-row { display: flex; align-items: center; gap: 8px; font-size: 12.5px; padding: 5px 8px; border-radius: 8px; background: var(--bg2); cursor: pointer; }
+.pick-row.disabled { opacity: .55; cursor: not-allowed; }
+.rs-item { border: 1px solid var(--line); border-radius: 9px; padding: 8px 10px; display: flex; flex-direction: column; gap: 7px; }
+.rs-title { font-size: 12.5px; font-weight: 700; }
 .badge-links { margin-top: 10px; display: flex; flex-direction: column; gap: 5px; }
 .bl-row { display: flex; align-items: center; gap: 8px; font-size: 12px; background: var(--bg2); border-radius: 8px; padding: 6px 10px; flex-wrap: wrap; }
 .mini { background: #fff; border: 1px solid var(--line); border-radius: 7px; font-size: 11px; padding: 2px 8px; color: var(--accent2); margin-left: auto; }

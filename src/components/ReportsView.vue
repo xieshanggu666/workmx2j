@@ -109,6 +109,12 @@ function incidentImpact(i) {
   if (im.matches_rescheduled) p.push(`改期 ${im.matches_rescheduled} 场`)
   return p.length ? p.join('；') : '现场处置（无联动）'
 }
+// 事件关联场次（可多场）：单场显示对阵，多场显示场次数
+function incidentMatchesText(i) {
+  if (!i.matches?.length) return ''
+  if (i.matches.length === 1) return `${i.matches[0].teamA?.name || '待定'}VS${i.matches[0].teamB?.name || '待定'}`
+  return `${i.matches.length} 场比赛`
+}
 const pausedMatches = computed(() => store.matches.filter(m => m.is_paused))
 </script>
 
@@ -258,7 +264,7 @@ const pausedMatches = computed(() => store.matches.filter(m => m.is_paused))
               <td class="mono" style="font-weight:800;color:var(--accent3)">{{ i.code }}</td>
               <td>{{ INC_CAT_LABEL[i.category] }}<div v-if="i.severity" :class="'tag ' + (i.severity === 'major' ? 'r' : i.severity === 'general' ? 'y' : 'b')" style="margin-top:3px">{{ { major: '重大', general: '较大', minor: '一般' }[i.severity] }}</div></td>
               <td class="ph" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ i.description }}</td>
-              <td class="ph" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ [i.venue?.name, i.match ? i.match.teamA?.name + 'VS' + i.match.teamB?.name : ''].filter(Boolean).join(' · ') || '—' }}</td>
+              <td class="ph" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ [i.venue?.name, incidentMatchesText(i)].filter(Boolean).join(' · ') || '—' }}</td>
               <td><span class="tag" :class="INC_STATUS_TAG[i.status]">{{ INC_STATUS_LABEL[i.status] }}</span></td>
               <td class="ph" style="max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ incidentImpact(i) }}</td>
               <td class="ph" style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ i.close_summary || '—' }}</td>

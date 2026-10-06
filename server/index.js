@@ -768,23 +768,25 @@ function seed() {
   resolveIncident(inc1.id, { note: '伤者处理完毕，现场秩序恢复，无需升级处置', operator: '赵医生' })
   closeIncident(inc1.id, { summary: '一般擦伤，医疗处置及时，无后续影响', operator: '组委会值班' })
 
-  // SI-2：重大·治安事件（处置中，联动暂扣证件 + 暂停足球 B 组末轮）——观众席冲突，客队随队人员持无效带队证件
+  // SI-2：重大·治安事件（处置中，联动暂扣证件 + 一次关联并批量暂停足球 A/B 组末轮 2 场）——观众席冲突，客队随队人员持无效带队证件
   const gateMatchB = get(`SELECT m.* FROM matches m WHERE m.sport_id=? AND m.group_name='B组' AND m.status='scheduled'`, spFoot)
+  const gateMatchesLeft = [gateMatchB, gateMatch].filter(Boolean)   // 五人足球场今日末轮小组赛（B 组 + A 组）
   const inc2 = reportIncident({
     category: 'security', reporter_role: 'security', reporter_name: '钱安保',
     venue_id: gateMatchB ? gateMatchB.venue_id : vid('五人足球场'),
-    match_id: gateMatchB?.id,
+    match_ids: gateMatchesLeft.map(m => m.id),
     description: '五人足球场西看台两队球迷发生口角推搡，一名无有效带队证件的随队人员试图冲击隔离栏，已当场控制。'
   })
   triageIncident(inc2.id, { severity: 'major', lead: 'security', dispatch_note: '重大治安事件：安保牵头隔离冲突双方，裁判组暂停待赛场次，医疗待命', operator: '组委会主任' })
-  progressIncident(inc2.id, { role: 'referee', note: '裁判组已收到暂停通知，B 组末轮开赛准备暂停，双方队伍留在热身区等候', operator: '张裁判' })
+  progressIncident(inc2.id, { role: 'referee', note: '裁判组已收到暂停通知，末轮小组赛开赛准备暂停，各队留在热身区等候', operator: '张裁判' })
   progressIncident(inc2.id, { role: 'medical', note: '医疗点两名医护携急救包抵达西看台，暂无人员受伤', operator: '赵医生' })
   // 暂扣一张证件演示联动：取一张有效队伍证件作为"违纪随队人员持证人"（仅演示暂扣链路）
   const demoBlockBadge = gateMatchB ? get(`SELECT * FROM badges WHERE subject_type='team' AND subject_id=?`, gateMatchB.team_b) : null
   if (demoBlockBadge) {
     incidentBlockBadge(inc2.id, { badge_id: demoBlockBadge.id, reason: '持证人卷入看台冲突并冲击隔离栏，调查期间暂扣入场证件', role: 'security', operator: '钱安保' })
   }
-  if (gateMatchB) incidentPauseMatch(inc2.id, { reason: '西看台治安冲突未平息，暂停 B 组末轮，暂停入场核验', role: 'security', operator: '组委会主任' })
+  // 一起事件关联多场比赛：批量暂停五人足球场今日全部末轮小组赛（入场核验/裁判签到/成绩录入同步锁定）
+  if (gateMatchesLeft.length) incidentPauseMatch(inc2.id, { match_ids: gateMatchesLeft.map(m => m.id), reason: '西看台治安冲突未平息，五人足球场末轮小组赛全部暂停，暂停入场核验', role: 'security', operator: '组委会主任' })
 
   // SI-3：较大·场地器材（已结案，联动暂停→改期羽毛球季军战）——备用场地地胶起翘
   const thirdBad = get(`SELECT * FROM matches WHERE sport_id=? AND stage='季军' AND status='scheduled'`, spBad)
@@ -2330,6 +2332,16 @@ function incidentOpen(id, allow = null) {
   }
   return inc
 }
+// 事件关联场次集合：一起安全事件可关联多场比赛（incident_matches），兼容旧字段 incidents.match_id
+function incidentMatchIds(id, inc = null) {
+  const ids = all(`SELECT match_id FROM incident_matches WHERE incident_id=? ORDER BY id`, id).map(r => r.match_id)
+  const legacy = inc ? inc.match_id : get('SELECT match_id FROM incidents WHERE id=?', id)?.match_id
+  if (legacy && !ids.includes(legacy)) ids.unshift(legacy)
+  return ids
+}
+function linkIncidentMatch(incidentId, matchId) {
+  if (matchId) run(`INSERT OR IGNORE INTO incident_matches (incident_id,match_id) VALUES (?,?)`, incidentId, matchId)
+}
 const incidentSeverityRank = { major: 3, general: 2, minor: 1 }
 
 // 四方协同上报
@@ -2344,25 +2356,31 @@ function reportIncident(body) {
     const reporterName = (body.reporter_name || '').trim() || INCIDENT_ROLE[reporterRole]
     const venueId = body.venue_id ? Number(body.venue_id) : null
     if (venueId && !get('SELECT id FROM venues WHERE id=?', venueId)) throw new Error('事发场地不存在')
-    let matchId = body.match_id ? Number(body.match_id) : null
-    let match = null
-    if (matchId) {
-      match = get('SELECT * FROM matches WHERE id=?', matchId)
-      if (!match) throw new Error('关联场次不存在')
-      matchId = match.id
-      if (venueId == null) { /* 场地随场次带出，便于无指定场地时定位 */ }
+    // 关联场次：支持一次关联多场比赛（match_ids 数组），兼容单场 match_id
+    const matchIds = [...new Set(
+      (Array.isArray(body.match_ids) && body.match_ids.length ? body.match_ids : [body.match_id])
+        .filter(x => x !== null && x !== undefined && x !== '')
+        .map(Number)
+    )]
+    const matches = []
+    for (const mid of matchIds) {
+      const m = get('SELECT * FROM matches WHERE id=?', mid)
+      if (!m) throw new Error(`关联场次 #${mid} 不存在`)
+      matches.push(m)
     }
+    const matchId = matches[0]?.id ?? null   // incidents.match_id 保留主关联场次（兼容旧查询）
     const code = nextIncidentCode()
     const r = run(`INSERT INTO incidents (code,category,reporter_role,reporter_name,venue_id,match_id,description,status)
                    VALUES (?,?,?,?,?,?,?, 'pending')`,
       code, category, reporterRole, reporterName, venueId, matchId, description)
     const id = Number(r.lastInsertRowid)
+    matches.forEach(m => linkIncidentMatch(id, m.id))
     const loc = [
-      venueId ? get('SELECT name FROM venues WHERE id=?', venueId)?.name : null,
-      match ? matchTitle(match) : null
+      venueId ? '地点：' + get('SELECT name FROM venues WHERE id=?', venueId)?.name : null,
+      matches.length ? '关联场次：' + matches.map(m => matchTitle(m)).join('、') : null
     ].filter(Boolean).join('；')
     addIncidentLog(id, 'submit',
-      `${INCIDENT_ROLE[reporterRole]}上报安全事件（${INCIDENT_CATEGORY[category]}）：${description}${loc ? '（地点：' + loc + '）' : ''}`,
+      `${INCIDENT_ROLE[reporterRole]}上报安全事件（${INCIDENT_CATEGORY[category]}）：${description}${loc ? '（' + loc + '）' : ''}`,
       { role: reporterRole, matchId, operator: reporterName })
     return { ok: true, id, code }
   })
@@ -2462,83 +2480,142 @@ function incidentReleaseBadge(id, linkId, body = {}) {
 }
 
 // 联动：暂停场次（停止入场核验、锁定比分录入，等待恢复或改期）
+// 支持一次批量暂停多场（match_ids 数组）；未指定场次时回退事件全部关联场次。
+// 批量暂停在单事务内完成：任一场次不可暂停（已完赛/被其它事件暂停）则整单回滚；
+// 本事件已暂停的场次按幂等跳过，不重复留痕。
 function incidentPauseMatch(id, body = {}) {
   return withTransaction(() => {
     const inc = incidentOpen(id, ['handling', 'resolved'])
-    const matchId = body.match_id ? Number(body.match_id) : inc.match_id
-    const m = matchId ? get('SELECT * FROM matches WHERE id=?', matchId) : null
-    if (!m) throw new Error('请选择要暂停的关联场次')
-    if (m.status !== 'scheduled') throw new Error('仅待赛场次可以暂停（已完赛/取消场次无需暂停）')
+    let ids = Array.isArray(body.match_ids) && body.match_ids.length
+      ? body.match_ids.map(Number)
+      : [body.match_id ? Number(body.match_id) : null].filter(Boolean)
+    if (!ids.length) ids = incidentMatchIds(id, inc)
+    ids = [...new Set(ids)]
+    if (!ids.length) throw new Error('请选择要暂停的关联场次')
     const operator = (body.operator || INCIDENT_ROLE[inc.lead || 'organizer']).trim() || '组委会'
-    if (m.is_paused) {
-      if (m.pause_incident_id !== id) throw new Error('该场次已被另一安全事件暂停')
-      return { ok: true, idempotent: true }
-    }
     const reason = (body.reason || `${inc.code} 安全事件暂停（${INCIDENT_CATEGORY[inc.category]}）`).trim()
-    run(`UPDATE matches SET is_paused=1, pause_incident_id=?, pause_reason=?, paused_at=datetime('now','localtime') WHERE id=?`, id, reason, m.id)
-    addIncidentLog(id, 'match_pause', `暂停场次：${matchTitle(get('SELECT * FROM matches WHERE id=?', m.id))}；${reason}`,
-      { role: body.role || inc.lead || 'organizer', matchId: m.id, operator })
-    addAccessLog('incident_pause', null, null, `${matchTitle(m)} 因安全事件 ${inc.code} 暂停，入场核验与比分录入已锁定`, reason, operator, 'danger', m.id, m.venue_id)
-    addLog('match_change', m.id, null, `${matchTitle(m)} 因安全事件 ${inc.code} 暂停`, reason, operator)
+    const paused = []
+    let skipped = 0
+    for (const mid of ids) {
+      const m = get('SELECT * FROM matches WHERE id=?', mid)
+      if (!m) throw new Error(`场次 #${mid} 不存在`)
+      if (m.status !== 'scheduled') throw new Error(`仅待赛场次可以暂停（「${matchTitle(m)}」已完赛/取消）`)
+      if (m.is_paused) {
+        if (m.pause_incident_id !== id) throw new Error(`「${matchTitle(m)}」已被另一安全事件暂停`)
+        skipped++
+        linkIncidentMatch(id, m.id)
+        continue
+      }
+      run(`UPDATE matches SET is_paused=1, pause_incident_id=?, pause_reason=?, paused_at=datetime('now','localtime') WHERE id=?`, id, reason, m.id)
+      linkIncidentMatch(id, m.id)
+      paused.push(m)
+    }
+    // 逐场留痕：事件时间线 + 入场异常审计 + 排班变更留痕，三域同步
+    paused.forEach(m => {
+      addIncidentLog(id, 'match_pause', `暂停场次：${matchTitle(get('SELECT * FROM matches WHERE id=?', m.id))}；${reason}`,
+        { role: body.role || inc.lead || 'organizer', matchId: m.id, operator })
+      addAccessLog('incident_pause', null, null, `${matchTitle(m)} 因安全事件 ${inc.code} 暂停，入场核验与比分录入已锁定`, reason, operator, 'danger', m.id, m.venue_id)
+      addLog('match_change', m.id, null, `${matchTitle(m)} 因安全事件 ${inc.code} 暂停`, reason, operator)
+    })
+    if (paused.length > 1) {
+      addIncidentLog(id, 'match_pause',
+        `批量暂停 ${paused.length} 场比赛：${paused.map(m => matchTitle(m)).join('、')}；入场核验、裁判签到与成绩录入已同步锁定`,
+        { role: body.role || inc.lead || 'organizer', operator })
+    }
     persistIncidentImpact(id)
-    return { ok: true }
+    if (!paused.length) return { ok: true, idempotent: true, paused: 0, skipped }
+    return { ok: true, paused: paused.length, skipped }
   })
 }
 
 // 联动：恢复场次（解除暂停，原档期继续）
+// 支持 match_ids 批量恢复，或 all=true 一键恢复本事件全部暂停场次；单事务批量落库，逐场留痕。
 function incidentResumeMatch(id, body = {}) {
   return withTransaction(() => {
     const inc = incidentOpen(id, ['handling', 'resolved'])
-    const matchId = body.match_id ? Number(body.match_id) : inc.match_id
-    const m = matchId ? get('SELECT * FROM matches WHERE id=?', matchId) : null
-    if (!m) throw new Error('场次不存在')
-    if (!m.is_paused) return { ok: true, idempotent: true }
-    if (m.pause_incident_id !== id) throw new Error('该场次由另一安全事件暂停，需由该事件恢复')
+    let ids
+    if (Array.isArray(body.match_ids) && body.match_ids.length) ids = body.match_ids.map(Number)
+    else if (body.all) ids = all(`SELECT id FROM matches WHERE pause_incident_id=? AND is_paused=1`, id).map(r => r.id)
+    else ids = [body.match_id ? Number(body.match_id) : inc.match_id].filter(Boolean)
+    ids = [...new Set(ids)]
+    if (!ids.length) throw new Error('没有需要恢复的暂停场次')
     const operator = (body.operator || INCIDENT_ROLE[inc.lead || 'organizer']).trim() || '组委会'
     const note = (body.note || '').trim()
-    run(`UPDATE matches SET is_paused=0, pause_reason=NULL, resume_incident_id=?, resumed_at=datetime('now','localtime') WHERE id=?`, id, m.id)
-    const detail = `恢复场次：${matchTitle(get('SELECT * FROM matches WHERE id=?', m.id))}，恢复入场核验与比分录入${note ? '；' + note : ''}`
-    addIncidentLog(id, 'match_resume', detail, { role: body.role || inc.lead || 'organizer', matchId: m.id, operator })
-    addAccessLog('incident_resume', null, null, `${matchTitle(m)} 随安全事件 ${inc.code} 恢复，入场核验放行恢复`, note, operator, 'info', m.id, m.venue_id)
-    addLog('match_change', m.id, null, `${matchTitle(m)} 安全事件 ${inc.code} 处置恢复`, note || '安全事件处置恢复', operator)
+    const resumed = []
+    let skipped = 0
+    for (const mid of ids) {
+      const m = get('SELECT * FROM matches WHERE id=?', mid)
+      if (!m) throw new Error(`场次 #${mid} 不存在`)
+      if (!m.is_paused) { skipped++; continue }   // 幂等：未暂停的场次跳过
+      if (m.pause_incident_id !== id) throw new Error(`「${matchTitle(m)}」由另一安全事件暂停，需由该事件恢复`)
+      run(`UPDATE matches SET is_paused=0, pause_reason=NULL, resume_incident_id=?, resumed_at=datetime('now','localtime') WHERE id=?`, id, m.id)
+      resumed.push(m)
+    }
+    resumed.forEach(m => {
+      const detail = `恢复场次：${matchTitle(get('SELECT * FROM matches WHERE id=?', m.id))}，恢复入场核验与比分录入${note ? '；' + note : ''}`
+      addIncidentLog(id, 'match_resume', detail, { role: body.role || inc.lead || 'organizer', matchId: m.id, operator })
+      addAccessLog('incident_resume', null, null, `${matchTitle(m)} 随安全事件 ${inc.code} 恢复，入场核验放行恢复`, note, operator, 'info', m.id, m.venue_id)
+      addLog('match_change', m.id, null, `${matchTitle(m)} 安全事件 ${inc.code} 处置恢复`, note || '安全事件处置恢复', operator)
+    })
+    if (resumed.length > 1) {
+      addIncidentLog(id, 'match_resume',
+        `批量恢复 ${resumed.length} 场比赛：${resumed.map(m => matchTitle(m)).join('、')}；入场核验与成绩录入同步恢复`,
+        { role: body.role || inc.lead || 'organizer', operator })
+    }
     persistIncidentImpact(id)
-    return { ok: true }
+    if (!resumed.length) return { ok: true, idempotent: true, resumed: 0, skipped }
+    return { ok: true, resumed: resumed.length, skipped }
   })
 }
 
 // 联动：暂停场次改期（沿用赛程变更的冲突检测/自动重排，成功后解除暂停并记录原档期）
+// 支持 items 数组一次批量改期多场关联场次：全部场次在同一事务内依次改期，
+// 场地/裁判冲突无法解决时任一场失败整单原子回滚，不留半改期中间态。
 function incidentRescheduleMatch(id, body) {
   return withTransaction(() => {
     const inc = incidentOpen(id, ['handling', 'resolved'])
-    const matchId = body.match_id ? Number(body.match_id) : inc.match_id
-    const m = matchId ? get('SELECT * FROM matches WHERE id=?', matchId) : null
-    if (!m) throw new Error('请选择要改期的场次')
-    if (m.status !== 'scheduled') throw new Error('仅待赛场次可以改期')
+    const items = Array.isArray(body.items) && body.items.length
+      ? body.items
+      : [{ match_id: body.match_id, time_label: body.time_label, venue_id: body.venue_id }]
     const operator = (body.operator || INCIDENT_ROLE[inc.lead || 'organizer']).trim() || '组委会'
     const reason = (body.reason || '').trim() || `安全事件 ${inc.code} 处置改期`
-    const wasPaused = !!m.is_paused
-    const origTime = m.time_label, origVenue = m.venue_id
-    const r = updateMatchSchedule(m.id, {
-      time_label: body.time_label, venue_id: body.venue_id === undefined ? m.venue_id : body.venue_id,
-      operator, reason: `安全事件 ${inc.code} 改期：${reason}`,
-      force: !!body.force, auto_rearrange: body.auto_rearrange !== false, allow_paused: true
-    })
-    if (r.unchanged) throw new Error('改期时间/场地与原档期一致，无需改期')
-    // 改期成功：解除暂停，留存原档期与事件编号（origTime/origVenue 为改期前快照，不能再读已更新的列）
-    run(`UPDATE matches SET is_paused=0, pause_reason=NULL, resume_incident_id=?, resumed_at=datetime('now','localtime'),
-         reschedule_incident_code=?, orig_time_label=?, orig_venue_id=? WHERE id=?`,
-      id, inc.code, origTime ?? fresh.time_label, origVenue ?? null, m.id)
-    const fresh = get('SELECT * FROM matches WHERE id=?', m.id)
-    const oldVenueName = origVenue ? get('SELECT name FROM venues WHERE id=?', origVenue)?.name : '未指定'
-    const newVenueName = fresh.venue_id ? get('SELECT name FROM venues WHERE id=?', fresh.venue_id)?.name : '未指定'
-    addIncidentLog(id, 'match_reschedule',
-      `场次改期：${matchTitle(fresh)}；时间 ${origTime || '未指定'} → ${fresh.time_label || '未指定'}；场地 ${oldVenueName} → ${newVenueName}${wasPaused ? '；暂停随改期解除' : ''}`,
-      { role: body.role || inc.lead || 'organizer', matchId: m.id, operator })
-    addAccessLog('incident_reschedule', null, null,
-      `${matchTitle(fresh)} 因安全事件 ${inc.code} 改期（${origTime || '未指定'}/${oldVenueName} → ${fresh.time_label || '未指定'}/${newVenueName}），暂停同步解除`,
-      reason, operator, 'warn', m.id, fresh.venue_id)
+    const results = []
+    for (const item of items) {
+      const matchId = item.match_id ? Number(item.match_id) : inc.match_id
+      const m = matchId ? get('SELECT * FROM matches WHERE id=?', matchId) : null
+      if (!m) throw new Error('请选择要改期的场次')
+      if (m.status !== 'scheduled') throw new Error(`仅待赛场次可以改期（「${matchTitle(m)}」已完赛/取消）`)
+      const wasPaused = !!m.is_paused
+      const origTime = m.time_label, origVenue = m.venue_id
+      const r = updateMatchSchedule(m.id, {
+        time_label: item.time_label, venue_id: item.venue_id === undefined ? m.venue_id : item.venue_id,
+        operator, reason: `安全事件 ${inc.code} 改期：${reason}`,
+        force: !!body.force, auto_rearrange: body.auto_rearrange !== false, allow_paused: true
+      })
+      if (r.unchanged) throw new Error(`「${matchTitle(m)}」改期时间/场地与原档期一致，无需改期`)
+      // 改期成功：解除暂停，留存原档期与事件编号（origTime/origVenue 为改期前快照，不能再读已更新的列）
+      run(`UPDATE matches SET is_paused=0, pause_reason=NULL, resume_incident_id=?, resumed_at=datetime('now','localtime'),
+           reschedule_incident_code=?, orig_time_label=?, orig_venue_id=? WHERE id=?`,
+        id, inc.code, origTime ?? null, origVenue ?? null, m.id)
+      linkIncidentMatch(id, m.id)
+      const fresh = get('SELECT * FROM matches WHERE id=?', m.id)
+      const oldVenueName = origVenue ? get('SELECT name FROM venues WHERE id=?', origVenue)?.name : '未指定'
+      const newVenueName = fresh.venue_id ? get('SELECT name FROM venues WHERE id=?', fresh.venue_id)?.name : '未指定'
+      addIncidentLog(id, 'match_reschedule',
+        `场次改期：${matchTitle(fresh)}；时间 ${origTime || '未指定'} → ${fresh.time_label || '未指定'}；场地 ${oldVenueName} → ${newVenueName}${wasPaused ? '；暂停随改期解除' : ''}`,
+        { role: body.role || inc.lead || 'organizer', matchId: m.id, operator })
+      addAccessLog('incident_reschedule', null, null,
+        `${matchTitle(fresh)} 因安全事件 ${inc.code} 改期（${origTime || '未指定'}/${oldVenueName} → ${fresh.time_label || '未指定'}/${newVenueName}），暂停同步解除`,
+        reason, operator, 'warn', m.id, fresh.venue_id)
+      results.push({ match_id: m.id, ...r })
+    }
+    if (results.length > 1) {
+      addIncidentLog(id, 'match_reschedule',
+        `批量改期 ${results.length} 场比赛完成：${results.map(x => matchTitle(get('SELECT * FROM matches WHERE id=?', x.match_id))).join('、')}；执法名单随改期自动重排/补齐，暂停同步解除`,
+        { role: body.role || inc.lead || 'organizer', operator })
+    }
     persistIncidentImpact(id)
-    return { ok: true, ...r }
+    return { ok: true, count: results.length, results }
   })
 }
 
@@ -2890,6 +2967,9 @@ app.post('/api/appeals/:id/uphold', (req, res) => {
 const joinIncident = inc => {
   const venue = inc.venue_id ? get('SELECT id,name FROM venues WHERE id=?', inc.venue_id) : null
   const match = inc.match_id ? joinMatch(get('SELECT * FROM matches WHERE id=?', inc.match_id)) : null
+  // 一起事件可关联多场比赛：match 保留主关联（兼容），matches 为全量关联场次
+  const matchIds = incidentMatchIds(inc.id, inc)
+  const matches = matchIds.map(mid => joinMatch(get('SELECT * FROM matches WHERE id=?', mid))).filter(Boolean)
   const logs = all(`SELECT * FROM incident_logs WHERE incident_id=? ORDER BY id`, inc.id)
   const badgeLinks = all(`SELECT ib.*, b.code badge_code, b.name badge_name, b.subject_type, b.status badge_status
                           FROM incident_badges ib JOIN badges b ON b.id=ib.badge_id
@@ -2898,6 +2978,8 @@ const joinIncident = inc => {
     ...inc,
     impact: safeParseJson(inc.impact),
     venue, match,
+    match_ids: matchIds,
+    matches,
     logs,
     badge_links: badgeLinks.map(l => ({ ...l }))
   }

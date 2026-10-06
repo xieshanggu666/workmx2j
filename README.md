@@ -37,7 +37,7 @@ event/
         ├── BracketView.vue      # 对阵与积分榜
         ├── RegistrationView.vue # 报名与资格审核（提交/审核/退报/撤销，回显入场核验结果）
         ├── AccessView.vue       # 赛事证件与入场核验（扫码核验/证件管理/场次入场/流水/异常审计）
-        ├── IncidentView.vue     # 赛事安全事件处置（医疗/安保/裁判/组委会协同上报/分级/处置/结案，联动证件暂扣/场次暂停改期）
+        ├── IncidentView.vue     # 赛事安全事件处置（医疗/安保/裁判/组委会协同上报/分级/处置/结案，联动证件暂扣；一次关联多场比赛，批量暂停/恢复/改期）
         ├── AppealView.vue       # 赛事申诉复核（单位异议/受理改判/驳回，联动积分奖牌淘汰赛）
         ├── TeamView.vue         # 队伍与运动员
         ├── VenueView.vue        # 场地与裁判
@@ -73,9 +73,10 @@ npm run dev      # 后端 4170 + 前端 5203
 | `registrations` | 参赛报名与资格审核（kind：team/athlete，状态流转 pending→approved/rejected，退报 withdrawn / 撤销 revoked，含名额序号 quota_no、审核人与备注） |
 | `appeals` | 赛事申诉单（编号 SS-xxxx；target_type：match 球类比分 / track 田径成绩 / eligibility 参赛资格；状态 pending 待受理 → reviewing 复核中 → upheld 改判 / rejected 驳回，或 withdrawn 撤案；resolution 与 impact 记录改判结论及影响汇总） |
 | `appeal_logs` | 申诉全量审计（submit/accept/reject/withdraw/uphold，含人类可读详情、变更前后快照 JSON 与经办人，按申诉单串联时间线） |
-| `incidents` | 赛事安全事件（编号 SI-xxxx；category：injury 伤病/security 治安/dispute 冲突/facility 场地器材/weather 天气/other；reporter_role 上报岗位 medical/security/referee/organizer；severity 分级 major 重大/general 较大/minor 一般；lead 牵头方；状态 pending 待分级 → handling 处置中 → resolved 待结案 → closed 已结案；impact 汇总联动快照） |
-| `incident_logs` | 安全事件全量审计（submit/triage/progress/badge_block/badge_release/match_pause/match_resume/match_reschedule/resolve/reopen/close，含协同方角色、证件/场次引用与经办人，按事件串联时间线） |
+| `incidents` | 赛事安全事件（编号 SI-xxxx；category：injury 伤病/security 治安/dispute 冲突/facility 场地器材/weather 天气/other；reporter_role 上报岗位 medical/security/referee/organizer；severity 分级 major 重大/general 较大/minor 一般；lead 牵头方；状态 pending 待分级 → handling 处置中 → resolved 待结案 → closed 已结案；impact 汇总联动快照；match_id 为主关联场次，多场次关联见 `incident_matches`） |
+| `incident_logs` | 安全事件全量审计（submit/triage/progress/badge_block/badge_release/match_pause/match_resume/match_reschedule/resolve/reopen/close，含协同方角色、证件/场次引用与经办人，按事件串联时间线；批量联动除逐场留痕外追加批量汇总记录） |
 | `incident_badges` | 事件暂扣证件关联（incident×badge，active 暂扣中/released 已解除，原因与解除原因；一张证件可被多事件分别暂扣，全部解除才恢复有效） |
+| `incident_matches` | 事件关联场次（incident×match 唯一；一起事件可关联多场比赛，暂停/恢复/改期按关联集合批量联动，旧库由 `incidents.match_id` 自动回填） |
 | `venue_staff` | 场地工作人员（岗位 role：场地主管/医疗/安保/器材/媒体/志愿者 + 服务场地，状态 在岗/离岗） |
 | `badges` | 赛事证件（编号 T/A/R/S-xxxx，主体 team/athlete/referee/staff；`zones` 授权区域快照；status active/blocked，`block_manual` 标记人工暂扣，安全事件联动暂扣同样置位并在审计标注事件编号） |
 | `access_checkins` | 入场核验流水（pass/deny/forced_pass；is_duplicate 同日同场幂等；reason_code 拒绝原因码含 `MATCH_PAUSED` 场次安全暂停；回写各域的唯一数据源） |
@@ -127,7 +128,7 @@ npm run dev      # 后端 4170 + 前端 5203
 
 **🪪 联动证件暂扣**：处置中可暂扣任意赛事证件（原因必填），复用证件人工暂扣通道——入场核验一律以 `BADGE_BLOCKED` 拦截并计入异常审计，`access_logs` 的 block 记录标注事件编号。可在处置中逐项解除，结案默认统一解除；一张证件被多个事件暂扣时，**须全部事件解除后才恢复有效**。结案也可选择「继续暂扣」（责任追究/纪律调查，须注明原因，之后只能在证件管理页人工解除）。
 
-**⏸️ 联动场次暂停 / ▶️ 恢复 / 📅 改期**：对关联待赛场次一键暂停后：① 入场核验对队伍/运动员/裁判统一拒绝（原因码 `MATCH_PAUSED`）；② 成绩录入锁定；③ 普通改期入口锁定，必须走事件处置。恢复即按原档期继续。改期直接复用赛程变更引擎（场地/裁判冲突检测、自动重排与整场补齐、无法解决冲突时整单原子回滚，可强制保留），成功后自动解除暂停并留存**原档期/原场地与事件编号**；暂停、恢复、改期同时写入 `access_logs`（danger/info/warn）与 `assignment_logs`（`match_change`）。
+**⏸️ 联动场次暂停 / ▶️ 恢复 / 📅 改期（支持一次关联多场比赛）**：上报时或处置中可将一起事件关联到多场比赛（`incident_matches`），暂停/恢复/改期均可**逐场或批量**进行——批量暂停一次勾选多场（未指定时默认全部关联场次），一键全部恢复，批量改期逐场携带新时间/场地。暂停后：① 入场核验对队伍/运动员/裁判统一拒绝（原因码 `MATCH_PAUSED`）；② 成绩录入锁定；③ 普通改期入口锁定，必须走事件处置。恢复即按原档期继续。改期直接复用赛程变更引擎（场地/裁判冲突检测、自动重排与整场补齐，无法解决冲突时**整单原子回滚**——批量改期任一场失败，全部场次回滚且保持暂停，可强制保留），成功后自动解除暂停并留存**原档期/原场地与事件编号**。暂停、恢复、改期对每场比赛同步写入 `access_logs`（danger/info/warn）与 `assignment_logs`（`match_change`），批量操作另在 `incident_logs` 追加一条批量汇总；本事件已暂停/已恢复的场次重复提交按幂等跳过，被其它事件暂停的场次会拦截并使整单回滚。
 
 全部状态迁移与联动在 **`BEGIN IMMEDIATE` 单事务**内完成，重复提交/双击**幂等**返回首次结果，失败整体回滚。每一步（上报/分级/进展/暂扣/解除/暂停/恢复/改期/完成/退回/结案）都写入 `incident_logs` 时间线，联动结果汇总到 `incidents.impact`（暂扣/解除证件数、暂停/恢复/改期场次明细）。侧边导航对「待分级 + 待结案」显示角标，总览页展示未结重大事件与暂停场次，报表中心提供安全事件处置审计表。
 
@@ -179,4 +180,4 @@ npm run dev      # 后端 4170 + 前端 5203
 | `npm run build` | 构建前端产物（`dist/`） |
 | `npm run preview` | 预览构建产物 |
 
-> 内置演示数据：篮球（4 队单循环）、五人制足球（6 队分 A/B 组）、羽毛球（4 队单败淘汰）、田径 100 米（8 名运动员），已预录部分比赛使看板开箱即有数据。另含 4 起安全事件演示：一般伤病（已结案）、重大治安（处置中，暂扣证件 + 暂停 B 组末轮）、较大场地隐患（已结案，季军战暂停→改期）、待分级医疗事件。
+> 内置演示数据：篮球（4 队单循环）、五人制足球（6 队分 A/B 组）、羽毛球（4 队单败淘汰）、田径 100 米（8 名运动员），已预录部分比赛使看板开箱即有数据。另含 4 起安全事件演示：一般伤病（已结案）、重大治安（处置中，暂扣证件 + 一次关联并批量暂停足球 A/B 组末轮 2 场）、较大场地隐患（已结案，季军战暂停→改期）、待分级医疗事件。
